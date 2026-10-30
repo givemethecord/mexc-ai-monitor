@@ -1,0 +1,1 @@
+# mexc-ai-monitor
