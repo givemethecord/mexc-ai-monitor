@@ -17,10 +17,12 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+# Gemini SDK 임포트
 try:
-    from openai import AsyncOpenAI
+    from google import genai
+    from google.genai import types
 except Exception:
-    AsyncOpenAI = None
+    genai = None
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -33,13 +35,14 @@ DETAIL_LIMIT = int(os.getenv("DETAIL_SYMBOL_LIMIT", "60"))
 INTERVALS = [x.strip() for x in os.getenv("KLINE_INTERVALS", "Min1,Min5,Min15,Min60,Hour4").split(",") if x.strip()]
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "120"))
 AI_ENABLED = os.getenv("AI_ENABLED", "true").lower() == "true"
-AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+AI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 AI_COOLDOWN = int(os.getenv("AI_MIN_SECONDS_BETWEEN_CALLS_PER_SYMBOL", "300"))
 AI_HOURLY_LIMIT = int(os.getenv("AI_MAX_CALLS_PER_HOUR", "120"))
 
-# 텔레그램 환경 변수 설정
+# 텔레그램 및 제미나이 환경 변수 설정
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 db_lock = asyncio.Lock()
@@ -56,7 +59,9 @@ detail_symbols: set[str] = set()
 contracts: set[str] = set()
 ws_status = {"connected": False, "last_message": None, "last_error": None}
 client = httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "MEXC-AI-Market-Monitor/1.0"})
-ai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")) if (AsyncOpenAI and os.getenv("OPENAI_API_KEY")) else None
+
+# Gemini 클라이언트 초기화
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if (genai and GEMINI_API_KEY) else None
 
 
 async def send_telegram_message(text: str):
@@ -328,24 +333,27 @@ async def maybe_ai_analyze(symbol: str, structures: dict, candle_time: int):
         "rule": "Use only supplied market facts. Do not invent levels. Distinguish confirmed candle closes from live candle values. No moving averages or pivot indicators. Analysis only; never issue orders."
     }
     try:
-        response = await ai_client.responses.create(
+        # Gemini 비동기 API 호출
+        response = await ai_client.aio.models.generate_content(
             model=AI_MODEL,
-            instructions=(
-                "You are a cautious crypto futures market-structure analyst. "
-                "Return Korean concise JSON with keys: bias, summary, supports, resistances, "
-                "bullish_scenario, bearish_scenario, invalidation, confidence, evidence, caveats. "
-                "supports/resistances must be arrays of numeric prices derived only from supplied levels. "
-                "If data is insufficient, say so. Do not provide trade execution instructions or promise outcomes."
+            contents=json.dumps(payload, ensure_ascii=False),
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "You are a cautious crypto futures market-structure analyst. "
+                    "Return Korean concise JSON with keys: bias, summary, supports, resistances, "
+                    "bullish_scenario, bearish_scenario, invalidation, confidence, evidence, caveats. "
+                    "supports/resistances must be arrays of numeric prices derived only from supplied levels. "
+                    "If data is insufficient, say so. Do not provide trade execution instructions or promise outcomes."
+                ),
+                max_output_tokens=700,
             ),
-            input=json.dumps(payload, ensure_ascii=False),
-            max_output_tokens=700,
         )
-        text_out = response.output_text
+        text_out = response.text
         result = {"symbol": symbol, "updatedAt": int(time.time()), "raw": text_out,
-                  "market": payload, "source": "OpenAI"}
+                  "market": payload, "source": "Gemini"}
         
-        # 텔레그램으로 분석 결과 전송 추가
-        tg_message = f"🚨 **[AI Market Analysis]**\n- 종목: `{symbol}`\n- 결과:\n{text_out}"
+        # 텔레그램으로 분석 결과 전송
+        tg_message = f"🚨 **[Gemini Market Analysis]**\n- 종목: `{symbol}`\n- 결과:\n{text_out}"
         await send_telegram_message(tg_message)
 
     except Exception as exc:
@@ -353,8 +361,8 @@ async def maybe_ai_analyze(symbol: str, structures: dict, candle_time: int):
         result = {"symbol": symbol, "updatedAt": int(time.time()), "raw": None,
                   "error": str(exc), "market": payload, "source": "AI error"}
         
-        # 에러 발생 시에도 텔레그램으로 알림 전송
-        await send_telegram_message(f"⚠️ **[AI Analysis Error]**\n- 종목: `{symbol}`\n- 에러: {exc}")
+        # 에러 발생 시 텔레그램 전송
+        await send_telegram_message(f"⚠️ **[Gemini Analysis Error]**\n- 종목: `{symbol}`\n- 에러: {exc}")
 
     analysis_state.setdefault(symbol, {}).update({"ai": result})
     async with db_lock:
