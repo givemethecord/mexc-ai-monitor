@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MEXC AI Market Monitor</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#121a2b;--line:#253149;--muted:#93a4bd;--text:#edf3ff;--green:#36d399;--red:#fb7185;--amber:#fbbf24}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px system-ui,-apple-system,Segoe UI,sans-serif}
+header{display:flex;gap:16px;align-items:center;justify-content:space-between;padding:18px 22px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#0b1020ee;z-index:3}
+h1{font-size:18px;margin:0}small,.muted{color:var(--muted)}.status{display:flex;gap:12px;flex-wrap:wrap}
+.pill{padding:5px 9px;border:1px solid var(--line);border-radius:20px;color:var(--muted)}
+main{padding:18px;max-width:1600px;margin:auto}.cards{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:12px;margin-bottom:16px}
+.card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}.k{color:var(--muted);font-size:12px}.v{font-size:22px;font-weight:700;margin-top:6px}
+.layout{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(320px,1fr);gap:14px}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}input,select{background:#0c1424;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}th,td{text-align:right;padding:9px 7px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-weight:500;position:sticky;top:0;background:var(--panel)}th:first-child,td:first-child{text-align:left}
+.tablewrap{max-height:68vh;overflow:auto}.up{color:var(--green)}.down{color:var(--red)}.neutral{color:var(--muted)}
+button{cursor:pointer;background:#1d3556;color:var(--text);border:1px solid #31527e;padding:8px 10px;border-radius:8px}
+button:hover{background:#27466f}.analysis{white-space:pre-wrap;line-height:1.55;max-height:68vh;overflow:auto}
+.event{padding:10px 0;border-bottom:1px solid var(--line)}.event b{color:#b7ccff}.empty{color:var(--muted);padding:24px;text-align:center}
+@media(max-width:900px){.layout{grid-template-columns:1fr}.cards{grid-template-columns:repeat(2,1fr)}header{align-items:flex-start;flex-direction:column}}
+</style>
+</head>
+<body>
+<header><div><h1>MEXC AI MARKET MONITOR</h1><small>USDT 무기한 전체 티커 감시 · AI 분석 전용 · 주문 기능 없음</small></div>
+<div class="status"><span class="pill" id="ws">연결 확인 중</span><span class="pill" id="ai">AI 확인 중</span><span class="pill" id="updated">업데이트 대기</span></div></header>
+<main>
+<div class="cards">
+<div class="card"><div class="k">감시 중인 종목</div><div class="v" id="count">-</div></div>
+<div class="card"><div class="k">상세 멀티타임프레임 추적</div><div class="v" id="detailed">-</div></div>
+<div class="card"><div class="k">최근 1시간 AI 호출</div><div class="v" id="calls">-</div></div>
+<div class="card"><div class="k">데이터 연결</div><div class="v" id="connection">-</div></div>
+</div>
+<div class="layout">
+<section class="panel">
+<div class="toolbar"><input id="search" placeholder="종목 검색 (예: BTC)"><select id="sort"><option value="amount24">거래대금 순</option><option value="riseFallRate">등락률 순</option><option value="symbol">종목명 순</option></select><button id="refresh">새로고침</button></div>
+<div class="tablewrap"><table><thead><tr><th>종목</th><th>현재가</th><th>24h 등락</th><th>거래대금</th><th>OI</th><th>펀딩비</th></tr></thead><tbody id="markets"></tbody></table></div>
+</section>
+<section class="panel"><h3 style="margin-top:0">AI 분석 및 구조 변화</h3><div id="analysis" class="analysis"><div class="empty">AI 분석 결과를 기다리는 중입니다.<br>OPENAI_API_KEY를 설정하면 AI 해석이 활성화됩니다.</div></div><h3>최근 이벤트</h3><div id="events"></div></section>
+</div>
+<p class="muted">주의: 이 화면은 시장 데이터 모니터링 및 정보 분석용입니다. 데이터 지연·누락·거래소 장애가 발생할 수 있으며 투자 판단이나 주문을 자동 수행하지 않습니다.</p>
+</main>
+<script>
+let markets=[], analyses=[];
+const fmt=(v,n=6)=>v==null?'—':Number(v).toLocaleString('en-US',{maximumFractionDigits:n});
+function render(){
+ const q=document.getElementById('search').value.trim().toUpperCase(), sort=document.getElementById('sort').value;
+ let rows=markets.filter(x=>!q||x.symbol.includes(q));
+ rows.sort((a,b)=>sort==='symbol'?a.symbol.localeCompare(b.symbol):(Number(b[sort]||0)-Number(a[sort]||0)));
+ document.getElementById('markets').innerHTML=rows.slice(0,1000).map(x=>{
+ const pct=Number(x.riseFallRate||0)*100, cls=pct>0?'up':pct<0?'down':'neutral';
+ return `<tr data-symbol="${x.symbol}"><td><b>${x.symbol}</b></td><td>${fmt(x.lastPrice,10)}</td><td class="${cls}">${pct.toFixed(2)}%</td><td>${fmt(x.amount24,0)}</td><td>${fmt(x.holdVol,0)}</td><td>${x.fundingRate==null?'—':(Number(x.fundingRate)*100).toFixed(4)+'%'}</td></tr>`;
+ }).join('');
+ document.querySelectorAll('#markets tr').forEach(tr=>tr.onclick=()=>loadAnalysis(tr.dataset.symbol));
+}
+async function loadStatus(){
+ try{const s=await fetch('/api/status').then(r=>r.json());
+ document.getElementById('count').textContent=s.ticker_symbols;document.getElementById('detailed').textContent=s.detailed_symbols;
+ document.getElementById('calls').textContent=s.ai_calls_last_hour;document.getElementById('connection').textContent=s.ws.connected?'정상':'재연결 중';
+ document.getElementById('ws').textContent=s.ws.connected?'MEXC WS 연결':'MEXC WS 끊김';
+ document.getElementById('ai').textContent=s.ai_enabled?'OpenAI 분석 활성':'AI 키 미설정';
+ document.getElementById('updated').textContent='상태 '+new Date().toLocaleTimeString();
+ }catch(e){}
+}
+async function loadMarkets(){try{const d=await fetch('/api/markets?limit=2000').then(r=>r.json());markets=d.data||[];render();}catch(e){}}
+async function loadAnalysis(symbol){
+ try{const d=await fetch('/api/market/'+encodeURIComponent(symbol)).then(r=>r.json());
+ const a=d.analysis?.ai;
+ document.getElementById('analysis').textContent=a?.raw||`${symbol}\n현재가: ${fmt(d.ticker?.lastPrice)}\n\nAI 분석 대기 또는 데이터 준비 중입니다.`;
+ }catch(e){}
+}
+async function loadAnalyses(){
+ try{const d=await fetch('/api/analyses?limit=30').then(r=>r.json());analyses=d;
+ document.getElementById('events').innerHTML=d.slice(0,12).map(x=>`<div class="event"><b>${x.symbol}</b><br><small>${new Date(x.updatedAt*1000).toLocaleString()}</small></div>`).join('')||'<div class="muted">아직 분석 이벤트가 없습니다.</div>';
+ }catch(e){}
+}
+document.getElementById('search').oninput=render;document.getElementById('sort').onchange=render;
+document.getElementById('refresh').onclick=()=>{loadMarkets();loadStatus();loadAnalyses()};
+function connect(){
+ const proto=location.protocol==='https:'?'wss':'ws';const ws=new WebSocket(`${proto}://${location.host}/ws`);
+ ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='snapshot'){markets=m.markets||[];render();}
+ if(m.type==='tickers'){const map=new Map(markets.map(x=>[x.symbol,x]));(m.data||[]).forEach(x=>map.set(x.symbol,x));markets=[...map.values()];render();}
+ if(m.type==='ai_analysis'){const a=m.data;document.getElementById('analysis').textContent=a.raw||a.error||'AI 응답 없음';loadAnalyses();loadStatus();}
+ };
+ ws.onclose=()=>setTimeout(connect,3000);
+}
+loadMarkets();loadStatus();loadAnalyses();connect();setInterval(loadStatus,10000);setInterval(loadAnalyses,30000);
+</script>
+</body></html>
