@@ -37,6 +37,10 @@ AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 AI_COOLDOWN = int(os.getenv("AI_MIN_SECONDS_BETWEEN_CALLS_PER_SYMBOL", "300"))
 AI_HOURLY_LIMIT = int(os.getenv("AI_MAX_CALLS_PER_HOUR", "120"))
 
+# 텔레그램 환경 변수 설정
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 db_lock = asyncio.Lock()
 state_lock = asyncio.Lock()
@@ -53,6 +57,25 @@ contracts: set[str] = set()
 ws_status = {"connected": False, "last_message": None, "last_error": None}
 client = httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "MEXC-AI-Market-Monitor/1.0"})
 ai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")) if (AsyncOpenAI and os.getenv("OPENAI_API_KEY")) else None
+
+
+async def send_telegram_message(text: str):
+    """텔레그램 봇을 통해 메시지를 전송하는 함수"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram bot token or chat ID is not set.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+    try:
+        response = await client.post(url, json=payload)
+        if response.status_code != 200:
+            log.warning("Failed to send Telegram message: %s", response.text)
+    except Exception as exc:
+        log.error("Telegram request error: %s", exc)
 
 
 def db():
@@ -156,7 +179,6 @@ async def save_tickers(rows: list[dict]):
         symbol = row.get("symbol")
         if not symbol or not symbol.endswith("_USDT"):
             continue
-        # Preserve REST-enriched fields omitted by the global WS ticker stream.
         previous = tickers.get(symbol, {})
         for field in ("holdVol", "fundingRate", "bid1", "ask1", "indexPrice", "fairPrice"):
             if row.get(field) is None and previous.get(field) is not None:
@@ -175,7 +197,6 @@ async def save_tickers(rows: list[dict]):
 
 
 async def load_initial_tickers():
-    # One public request returns the ticker data set for all contracts.
     data = await rest_get("/api/v1/contract/ticker")
     rows = data if isinstance(data, list) else [data] if isinstance(data, dict) and data.get("symbol") else []
     await save_tickers(rows)
@@ -190,7 +211,6 @@ def select_detail_symbols():
 
 
 def parse_kline_payload(symbol: str, interval: str, data: dict):
-    # WS push uses seconds for t and fields o/h/l/c/v/q.
     ts = int(data.get("t") or time.time())
     return {
         "symbol": symbol, "interval": interval, "t": ts,
@@ -219,7 +239,6 @@ async def save_candle(c: dict):
 
 
 async def seed_history(symbol: str, interval: str):
-    # MEXC REST K-line returns parallel arrays (time/open/high/low/close/vol/amount).
     data = await rest_get(f"/api/v1/contract/kline/{symbol}", {"interval": interval, "limit": HISTORY_LIMIT})
     if not isinstance(data, dict) or "time" not in data:
         return
@@ -273,8 +292,6 @@ def structure_for(symbol: str, interval: str):
 
 
 async def evaluate_symbol(symbol: str, interval: str):
-    # AI decision is triggered only on a completed 1m/5m/15m/1h/4h candle update
-    # and rate-limited per symbol. This keeps data collection independent of AI calls.
     if interval not in ("Min1", "Min5", "Min15", "Min60", "Hour4"):
         return
     structures = {tf: structure_for(symbol, tf) for tf in ("Min1", "Min5", "Min15", "Min60", "Hour4")}
@@ -326,10 +343,19 @@ async def maybe_ai_analyze(symbol: str, structures: dict, candle_time: int):
         text_out = response.output_text
         result = {"symbol": symbol, "updatedAt": int(time.time()), "raw": text_out,
                   "market": payload, "source": "OpenAI"}
+        
+        # 텔레그램으로 분석 결과 전송 추가
+        tg_message = f"🚨 **[AI Market Analysis]**\n- 종목: `{symbol}`\n- 결과:\n{text_out}"
+        await send_telegram_message(tg_message)
+
     except Exception as exc:
         log.exception("AI analysis failed for %s", symbol)
         result = {"symbol": symbol, "updatedAt": int(time.time()), "raw": None,
                   "error": str(exc), "market": payload, "source": "AI error"}
+        
+        # 에러 발생 시에도 텔레그램으로 알림 전송
+        await send_telegram_message(f"⚠️ **[AI Analysis Error]**\n- 종목: `{symbol}`\n- 에러: {exc}")
+
     analysis_state.setdefault(symbol, {}).update({"ai": result})
     async with db_lock:
         con = db()
@@ -394,27 +420,6 @@ async def websocket_market_loop():
             backoff = min(backoff * 2, 60)
         finally:
             ws_status["connected"] = False
-
-
-async def detail_subscription_loop():
-    # All contracts are monitored by global ticker. Deep candles are maintained for
-    # the highest 24h turnover contracts to stay within practical WS/API limits.
-    subscribed: set[tuple[str, str]] = set()
-    while True:
-        await asyncio.sleep(30)
-        if not ws_status["connected"]:
-            continue
-        new_symbols = select_detail_symbols()
-        additions = [(s, tf) for s in new_symbols for tf in INTERVALS if (s, tf) not in subscribed]
-        removals = [(s, tf) for s, tf in subscribed if s not in new_symbols]
-        # Dedicated connection for candle streams.
-        # A separate task is used so ticker stream remains independent.
-        if additions or removals:
-            detail_symbols.clear()
-            detail_symbols.update(new_symbols)
-            # Persist desired subscriptions; candle worker reconnects and resubscribes.
-            await broadcast({"type": "detail_universe", "symbols": sorted(new_symbols), "count": len(new_symbols)})
-
 
 
 async def candle_websocket_loop():
@@ -501,7 +506,6 @@ async def contract_refresh_loop():
 
 
 async def ticker_fallback_loop():
-    # REST enrichment refreshes OI/funding fields; WS remains the price feed.
     while True:
         await asyncio.sleep(60)
         try:
